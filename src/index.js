@@ -1,14 +1,16 @@
-import fetch, { Headers, fileFromSync } from "node-fetch";
-import path from 'path';
+import fetch, { Headers } from "node-fetch";
 import HttpProxyAgent from "http-proxy-agent";
 import HttpsProxyAgent from "https-proxy-agent";
-import { isPlainObject } from "./util/isPlainObject.js";
-import fs, { statSync } from "fs";
+import fs from "fs";
 import { fileURLToPath } from 'url';
 import FormData from 'form-data'
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream';
+import { promisify } from 'node:util'
+import _ from "lodash";
+import path from "path";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const streamPipeline = promisify(pipeline);
 
 class request {
   constructor(url, method, filepath) {
@@ -58,6 +60,10 @@ class request {
     return this;
   }
 
+  progress(fn) {
+    this.onProgress = fn;
+    return this;
+  }
   /**
    * 添加事件
    * @param {string} event 事件名称
@@ -155,18 +161,17 @@ class request {
     if (this.option.json && param.body) {
       param.body = JSON.stringify(param.body);
     } else if (this.option.files) {
-      console.log(this.option.files)
       const form = new FormData()
       Object.keys(this.option.files).forEach(key => {
         const filepath = this.option.files[key]
-        console.log(filepath)
         if (typeof filepath === 'string') {
           // form.set(key, fileFromSync(filepath, 'image/jpeg', { highWaterMark: 2 * 1024 * 1024 }), 'test.jpeg');
-          form.append(key, fs.createReadStream(filepath), { knownLength: statSync(filepath).size })
+          form.append(key, fs.readFileSync(filepath), { filename: path.basename(filepath) })
         } else if (filepath instanceof Array) {
           // TODO:
         }
       })
+      param.headers = form.getHeaders();
       param.body = form;
     }
     if (this.option.proxy) {
@@ -176,7 +181,7 @@ class request {
   }
   async then(cb) {
     let href = this.option.url;
-    if (isPlainObject(this.option.query) && this.option.query !== null) {
+    if (_.isPlainObject(this.option.query) && this.option.query !== null) {
       const uri = new URL(this.option.url);
       for (let k in this.option.query) {
         uri.searchParams.set(k, this.option.query[k])
@@ -185,16 +190,39 @@ class request {
     }
     const response = await fetch(href, this._generateParam());
     if (response.ok) {
+      // 显示进度
+      const total = parseInt(response.headers.get('content-length') || 0, 10);
+      let count = 0;
+      const print = _.throttle(() => {
+        this.onProgress && this.onProgress(count, total);
+      }, 500);
+
       if (response.headers.get('Content-Type').includes('application/json')) {
         const res = await response.json();
         cb && cb(res)
+        return res;
+      } else if (this.option.filepath) {
+        return await new Promise((resolve, reject) => {
+          response.body.on('data', chunk => {
+            count += chunk.length;
+            print();
+          });
+          response.body.on('error', err => {
+            reject(err);
+          });
+          response.body.on('end', () => {
+            cb && cb();
+            resolve()
+          })
+          streamPipeline(response.body, createWriteStream(this.option.filepath));
+        })
       } else {
         const res = await response.text();
         cb && cb(res)
+        return res;
       }
     } else {
-      console.log(response)
-      cb && cb(new Error('error:'));
+      Promise.reject(response);
     }
   }
 }
@@ -206,11 +234,7 @@ const shttp = {
   put: (url) => new request(url, 'PUT'),
   delete: (url) => new request(url, 'DELETE'),
   patch: (url) => new request(url, 'PATCH'),
-  download: (url, filepath, cb) => {
-    return new request(url, filepath).callback(cb);
-  },
-  downloads: (url) => { },
-
+  download: (url, filepath) => new request(url, 'GET', filepath),
 }
 
 export default shttp;
